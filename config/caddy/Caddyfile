@@ -1,0 +1,80 @@
+# Caddy delante de Slim: TLS, estáticos y media, cabeceras de seguridad.
+#
+# - /static/ → volumen `static` (lo llena `setup` con collectstatic).
+# - /media/ → volumen `media` (archivos que suben los usuarios; públicos).
+# - El resto → web:8000 (gunicorn).
+{
+	# Sin API de administración: la configuración es estática, se recarga
+	# reiniciando el contenedor.
+	admin off
+
+	servers {
+		# Detrás de otro proxy en una red privada, el cliente real viene en
+		# X-Forwarded-For.
+		trusted_proxies static private_ranges
+		# IP del cliente = la dirección más a la derecha no confiable (no se
+		# puede falsear).
+		trusted_proxies_strict
+	}
+}
+
+(slim) {
+	encode zstd gzip
+
+	request_body {
+		max_size {$UPLOAD_MAX_SIZE}
+	}
+
+	# Una directiva por cabecera: en un solo bloque `header { }`, los campos
+	# con "?" se aplican juntos, solo si faltan todos.
+	header ?X-Content-Type-Options nosniff
+	header ?X-Frame-Options SAMEORIGIN
+	header ?Referrer-Policy strict-origin-when-cross-origin
+	header -Server
+
+	# HSTS solo con HTTPS: directo, o por un proxy (Traefik) que termina el TLS.
+	@secure expression `{http.request.scheme} == 'https' || {http.request.header.X-Forwarded-Proto} == 'https'`
+	header @secure Strict-Transport-Security "max-age=31536000"
+
+	handle /static/* {
+		root * /srv
+		header Cache-Control "public, max-age=3600"
+		file_server
+	}
+
+	handle /media/* {
+		root * /srv
+		header Cache-Control "public, max-age=3600"
+		file_server
+	}
+
+	handle {
+		# Emitir y generar PDF puede tardar: el timeout de lectura no debe ser
+		# menor al de gunicorn (300 s).
+		reverse_proxy web:8000 {
+			# gunicorn toma la IP del cliente del último X-Forwarded-For.
+			header_up X-Forwarded-For {client_ip}
+			# Caddy no reinicia X-Forwarded-Port de clientes no confiables.
+			header_up -X-Forwarded-Port
+			transport http {
+				response_header_timeout 300s
+				read_timeout 300s
+			}
+		}
+	}
+}
+
+# Sitio público. SITE_ADDRESS es ":80" (HTTP plano: local, o detrás de otro
+# proxy) o un dominio, con el que Caddy obtiene y renueva el certificado solo
+# ("localhost" usa la CA interna de Caddy).
+{$SITE_ADDRESS} {
+	import slim
+	log {
+		output stdout
+	}
+}
+
+# Sitio solo interno (puerto no publicado) para el healthcheck del contenedor.
+:8080 {
+	import slim
+}

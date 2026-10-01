@@ -1,0 +1,401 @@
+# Stack de LibreDTE Slim: Caddy (TLS, estáticos y media) + Slim (gunicorn y
+# dos workers de Celery) + LibreDTE Lib Core API + PostgreSQL + Valkey, con un
+# job de instalación (`setup`) y servicios opcionales (backup, mailpit, tools).
+#
+# Inicio rápido:
+#   cp .env.example .env
+#   docker compose up -d
+#   docker compose logs -f setup   # espera "==> Listo"
+#
+# Producción: parte de .env.prod.example. Ver README.md.
+#
+# Las variables obligatorias no tienen default: compose no arranca sin ellas.
+
+name: ${COMPOSE_PROJECT_NAME:-libredte-slim}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: "${LOG_MAX_FILE:-3}"
+
+# Imagen de Slim, compartida por setup, web, workers y console. El código se
+# clona de SLIM_REPO (rama por defecto o el tag SLIM_VERSION) al construirla.
+x-slim: &slim
+  image: libredte-slim:${SLIM_VERSION:-latest}
+  build:
+    context: ./image
+    args:
+      SLIM_REPO: ${SLIM_REPO:-https://github.com/LibreDTE/libredte-app-slim.git}
+      SLIM_VERSION: ${SLIM_VERSION:-}
+  logging: *logging
+  entrypoint: ["sh", "/usr/local/share/stack/scripts/entrypoint.sh"]
+
+# Variables de Slim (las vacías las elimina entrypoint.sh: Slim usa su default).
+x-slim-env: &slim-env
+  DEBUG: "0"
+  TZ: ${TZ:-America/Santiago}
+  # Con el sistema de archivos de solo lectura, gunicorn necesita un HOME escribible.
+  HOME: /tmp
+  SECRET_KEY: ${SECRET_KEY:-}
+  FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:-}
+  SITE_HOSTNAME: ${SITE_HOSTNAME:?Define SITE_HOSTNAME en .env (ej. slim.example.com)}
+  SITE_URL_SCHEMA: ${SITE_URL_SCHEMA:-http}
+  SITE_EXTRA_HOSTS: ${SITE_EXTRA_HOSTS:-}
+  # Solo Caddy llega a Slim: se confía en su X-Forwarded-Proto.
+  SITE_BEHIND_PROXY: "1"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DB_ENGINE: postgresql
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: ${DB_NAME:-libredte_slim}
+  DB_USER: ${DB_USER:-libredte_slim}
+  DB_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+  CELERY_BROKER_URL: redis://valkey:6379/0
+  EMAIL_HOST: ${EMAIL_HOST:-}
+  EMAIL_PORT: ${EMAIL_PORT:-}
+  EMAIL_USE_SSL: ${EMAIL_USE_SSL:-}
+  EMAIL_USE_TLS: ${EMAIL_USE_TLS:-}
+  EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
+  EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
+  DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL:-}
+  PLUGIN_LIBREDTE_BACKEND_API_URL: http://libredte-lib-core-api/api
+  PLUGIN_LIBREDTE_BACKEND_API_TOKEN: ${PLUGIN_LIBREDTE_BACKEND_API_TOKEN:-}
+  PLUGIN_APIGATEWAYCL_API_URL: ${PLUGIN_APIGATEWAYCL_API_URL:-}
+  PLUGIN_APIGATEWAYCL_API_TOKEN: ${PLUGIN_APIGATEWAYCL_API_TOKEN:-}
+  CORE_API_VERSION: ${CORE_API_VERSION:-latest}
+  LIBREDTE_BACKEND_COMMIT: ${LIBREDTE_BACKEND_COMMIT:-}
+
+x-slim-volumes: &slim-volumes
+  - media:/var/lib/slim/media
+  - emision_masiva:/var/lib/slim/emision_masiva
+  - state:/var/lib/slim/state
+  - ./scripts:/usr/local/share/stack/scripts:ro
+
+# Slim llega a servicios del host (ej. un webhook local) en
+# http://host.docker.internal:<puerto>, también en Linux. Va en todo
+# contenedor que corre código de Slim.
+x-host-access: &host-access
+  - "host.docker.internal:host-gateway"
+
+services:
+  db:
+    image: postgres:${POSTGRES_VERSION:-18}-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      TZ: ${TZ:-America/Santiago}
+      POSTGRES_DB: ${DB_NAME:-libredte_slim}
+      POSTGRES_USER: ${DB_USER:-libredte_slim}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+    volumes:
+      # PostgreSQL 18+ guarda los datos en un subdirectorio por versión mayor.
+      - db_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${DB_MEMORY_LIMIT:-1g}
+
+  # Broker de Celery y caché de Django (compatible con Redis).
+  valkey:
+    image: valkey/valkey:${VALKEY_VERSION:-9.2}-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          memory: ${VALKEY_MEMORY_LIMIT:-256m}
+
+  # El backend de Slim (timbra, firma, genera PDF, catálogos). Solo red interna.
+  libredte-lib-core-api:
+    image: ghcr.io/libredte/libredte-lib-core-api:${CORE_API_VERSION:-latest}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      TZ: ${TZ:-America/Santiago}
+      APP_URL: http://libredte-lib-core-api
+    # La imagen corre como root: se fuerza www-data (el puerto 80 lo permite su
+    # capability) y se deja el sistema de archivos de solo lectura.
+    user: "33:33"
+    read_only: true
+    tmpfs:
+      - /tmp:uid=33,gid=33
+      # Caché de Symfony de la API; mPDF escribe sus fuentes en /tmp.
+      - /app/var:uid=33,gid=33
+      - /data:uid=33,gid=33
+      - /config:uid=33,gid=33
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1/docs.html"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${CORE_API_MEMORY_LIMIT:-768m}
+
+  # Job de instalación: dueños de los volúmenes, secretos, migraciones,
+  # estáticos, catálogos del SII y, si SLIM_SEED_DEMO, datos de demostración.
+  # Seguro de repetir; corre en cada `up`.
+  setup:
+    <<: *slim
+    restart: "no"
+    # root solo para los dueños de los volúmenes; Slim corre como `slim`.
+    user: root
+    entrypoint: ["sh", "/usr/local/share/stack/scripts/setup.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      libredte-lib-core-api:
+        condition: service_healthy
+    environment:
+      <<: *slim-env
+      SLIM_SEED_DEMO: ${SLIM_SEED_DEMO:-0}
+    extra_hosts: *host-access
+    volumes:
+      - media:/var/lib/slim/media
+      - emision_masiva:/var/lib/slim/emision_masiva
+      - state:/var/lib/slim/state
+      - static:/srv/static
+      - ./scripts:/usr/local/share/stack/scripts:ro
+    deploy:
+      resources:
+        limits:
+          memory: ${SETUP_MEMORY_LIMIT:-1g}
+
+  # Slim (gunicorn, puerto interno 8000). Un PDF puede tardar: timeout alto.
+  web:
+    <<: *slim
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *slim-env
+      # Solo Caddy llega a gunicorn: se confía en sus X-Forwarded-*.
+      FORWARDED_ALLOW_IPS: "*"
+    extra_hosts: *host-access
+    volumes: *slim-volumes
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - sh
+      - -c
+      - >-
+        exec gunicorn --bind :8000 --workers ${WEB_WORKERS:-3} --threads ${WEB_THREADS:-4}
+        --worker-class gthread --worker-tmp-dir /dev/shm --timeout 300 --keep-alive 5
+        --max-requests 2000 --max-requests-jitter 200 --log-level info
+        config.wsgi:application
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${WEB_MEMORY_LIMIT:-1g}
+
+  # Celery, cola `default`.
+  worker:
+    <<: *slim
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *slim-env
+    extra_hosts: *host-access
+    volumes: *slim-volumes
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - sh
+      - -c
+      - >-
+        exec celery -A config worker -Q default --concurrency=${WORKER_CONCURRENCY:-3}
+        -n worker_default.%h -l INFO --without-gossip --without-mingle --without-heartbeat
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q celery /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEMORY_LIMIT:-1g}
+
+  # Celery, cola `emision_masiva` (tareas largas: de a una por proceso).
+  worker-emision-masiva:
+    <<: *slim
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *slim-env
+    extra_hosts: *host-access
+    volumes: *slim-volumes
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - sh
+      - -c
+      - >-
+        exec celery -A config worker -Q emision_masiva
+        --concurrency=${WORKER_EMISION_MASIVA_CONCURRENCY:-2} --prefetch-multiplier=1
+        -n worker_emision_masiva.%h -l INFO --without-gossip --without-mingle --without-heartbeat
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q celery /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_EMISION_MASIVA_MEMORY_LIMIT:-1g}
+
+  caddy:
+    image: caddy:${CADDY_VERSION:-2.11}-alpine
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Define SITE_ADDRESS en .env (:80 o el dominio del sitio)}
+      UPLOAD_MAX_SIZE: ${UPLOAD_MAX_SIZE:-32M}
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}:80"
+      - "${HTTP_BIND:-127.0.0.1}:${HTTPS_PORT:-8443}:443"
+      - "${HTTP_BIND:-127.0.0.1}:${HTTPS_PORT:-8443}:443/udp"
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - media:/srv/media:ro
+      - static:/srv/static:ro
+      # Certificados TLS (conservarlos: límites de Let's Encrypt).
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: ${CADDY_MEMORY_LIMIT:-256m}
+
+  # `manage.py` de Slim (perfil "tools"), por ejemplo:
+  #   docker compose run --rm console changepassword demo
+  console:
+    <<: *slim
+    profiles: ["tools"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *slim-env
+    extra_hosts: *host-access
+    volumes: *slim-volumes
+    entrypoint: ["sh", "/usr/local/share/stack/scripts/entrypoint.sh", "python", "manage.py"]
+    command: ["help"]
+    deploy:
+      resources:
+        limits:
+          memory: ${CONSOLE_MEMORY_LIMIT:-1g}
+
+  # Opcional (perfil "backup"): base de datos + media + secretos + .env cada
+  # BACKUP_INTERVAL_HOURS, durante BACKUP_KEEP_DAYS días, en el volumen
+  # `backups` (overrides/local-dirs.yaml los deja en un directorio local).
+  backup:
+    image: postgres:${POSTGRES_VERSION:-18}-alpine
+    profiles: ["backup"]
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      TZ: ${TZ:-America/Santiago}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-libredte_slim}
+      DB_USER: ${DB_USER:-libredte_slim}
+      DB_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD en .env}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
+    volumes:
+      # Lectura y escritura: `backup.sh restore` los repone.
+      - media:/data/media
+      - state:/data/state
+      - backups:/backups
+      - ./.env:/host/.env:ro
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    entrypoint: ["bash", "/usr/local/bin/backup.sh"]
+    healthcheck:
+      test: ["CMD", "bash", "/usr/local/bin/backup.sh", "health"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    deploy:
+      resources:
+        limits:
+          memory: ${BACKUP_MEMORY_LIMIT:-512m}
+
+  # Opcional (perfil "mailpit", desarrollo): recibe todo el correo saliente.
+  # EMAIL_HOST=mailpit y EMAIL_PORT=1025; interfaz web en MAILPIT_PORT.
+  mailpit:
+    image: axllent/mailpit:${MAILPIT_VERSION:-v1.31}
+    profiles: ["mailpit"]
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${MAILPIT_PORT:-8025}:8025"
+
+volumes:
+  db_data:
+  valkey_data:
+  media:
+  emision_masiva:
+  state:
+  static:
+  caddy_data:
+  caddy_config:
+  backups:

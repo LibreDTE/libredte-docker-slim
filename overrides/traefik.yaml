@@ -1,0 +1,35 @@
+# Publica el sitio a través de un Traefik existente, en vez de puertos del host.
+#
+# Traefik termina el TLS y reenvía HTTP plano a Caddy por una red Docker externa
+# compartida. Requerido en .env:
+#   COMPOSE_FILE=compose.yaml:overrides/traefik.yaml
+#   TRAEFIK_HOST=slim.example.com
+#   SITE_HOSTNAME=slim.example.com
+#   SITE_URL_SCHEMA=https
+#   SITE_ADDRESS=:80
+# Opcionales (con default): TRAEFIK_NETWORK, TRAEFIK_ENTRYPOINT,
+# TRAEFIK_CERTRESOLVER.
+#
+# Solo Caddy se une a la red de Traefik; la base de datos, Valkey y la Core API
+# siguen internas. Requiere Docker Compose 2.24+ (`!reset`).
+
+services:
+  caddy:
+    # Sin puertos del host: Traefik es la única entrada.
+    ports: !reset []
+    networks:
+      - default
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-shared_network}"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-libredte-slim}.rule=Host(`${TRAEFIK_HOST:?Define TRAEFIK_HOST en .env}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-libredte-slim}.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-libredte-slim}.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-libredte-slim}.service=${COMPOSE_PROJECT_NAME:-libredte-slim}"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-libredte-slim}.loadbalancer.server.port=80"
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-shared_network}

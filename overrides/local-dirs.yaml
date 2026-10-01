@@ -1,0 +1,58 @@
+# Guarda los datos del stack en directorios locales en vez de volúmenes
+# nombrados: se ven desde el host y entran fácil en los respaldos del servidor.
+# Recomendado en producción (un `docker compose down -v` no los borra).
+#
+# En .env:
+#   COMPOSE_FILE=compose.yaml:overrides/local-dirs.yaml
+#   DATA_DIR=./data        # opcional, por defecto ./data (relativo a compose.yaml)
+#
+# Solo cambian los directorios que dejes aquí; borra las líneas que no quieras
+# (por ejemplo, deja solo `media`, `state` y `backups`). Los datos que ya estén
+# en volúmenes nombrados NO se mueven: cámbialo antes del primer `up`, o repón un
+# respaldo después. `static` solo tiene archivos que `setup` genera en cada `up`.
+# `setup` deja `media`, `emision_masiva` y `state` a nombre del usuario `slim`
+# (UID 10001) en cada ejecución, también en Linux. Los respaldos quedan a nombre
+# de root con modo 0600.
+
+x-slim-dirs: &slim-dirs
+  - ${DATA_DIR:-./data}/media:/var/lib/slim/media
+  - ${DATA_DIR:-./data}/emision_masiva:/var/lib/slim/emision_masiva
+  - ${DATA_DIR:-./data}/state:/var/lib/slim/state
+  - ./scripts:/usr/local/share/stack/scripts:ro
+
+services:
+  db:
+    volumes:
+      - ${DATA_DIR:-./data}/db:/var/lib/postgresql
+  valkey:
+    volumes:
+      - ${DATA_DIR:-./data}/valkey:/data
+  setup:
+    volumes:
+      - ${DATA_DIR:-./data}/media:/var/lib/slim/media
+      - ${DATA_DIR:-./data}/emision_masiva:/var/lib/slim/emision_masiva
+      - ${DATA_DIR:-./data}/state:/var/lib/slim/state
+      - ${DATA_DIR:-./data}/static:/srv/static
+      - ./scripts:/usr/local/share/stack/scripts:ro
+  web:
+    volumes: *slim-dirs
+  worker:
+    volumes: *slim-dirs
+  worker-emision-masiva:
+    volumes: *slim-dirs
+  console:
+    volumes: *slim-dirs
+  caddy:
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${DATA_DIR:-./data}/media:/srv/media:ro
+      - ${DATA_DIR:-./data}/static:/srv/static:ro
+      - ${DATA_DIR:-./data}/caddy/data:/data
+      - ${DATA_DIR:-./data}/caddy/config:/config
+  backup:
+    volumes:
+      - ${DATA_DIR:-./data}/media:/data/media
+      - ${DATA_DIR:-./data}/state:/data/state
+      - ${DATA_DIR:-./data}/backups:/backups
+      - ./.env:/host/.env:ro
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
