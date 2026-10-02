@@ -8,7 +8,7 @@ servidor. Cada componente corre en su propio contenedor.
 | Componente | Imagen | Versión por defecto |
 |---|---|---|
 | Servidor web (TLS, estáticos, media) | `caddy:<ver>-alpine` | 2.11 |
-| LibreDTE Slim: web (gunicorn) y workers (Celery) | imagen propia (se construye al primer `up`) | último commit de la rama por defecto |
+| LibreDTE Slim: web (gunicorn) y workers (Celery) | `ghcr.io/libredte/libredte-app-slim` | `v0.1.0b1` |
 | Backend de Slim: LibreDTE Lib Core API | `ghcr.io/libredte/libredte-lib-core-api` | `latest` |
 | Base de datos | `postgres:<ver>-alpine` | 18 |
 | Cola y caché | `valkey/valkey:<ver>-alpine` | 9.2 |
@@ -23,7 +23,7 @@ accesible desde la red interna.
 - Docker Engine 24+ con el plugin Compose v2 (2.24+).
 - Unos 2 GB de disco para las imágenes y 2 GB de RAM para el stack (en reposo usa
   poco más de 1 GB).
-- Acceso a GitHub y a `ghcr.io` (el primer `up` clona Slim y baja la Core API).
+- Acceso a `ghcr.io` (el primer `up` baja las imágenes de Slim y de la Core API).
 - Desarrollo: puertos 8080, 8443 y 8025 libres. Producción: 80 y 443 alcanzables y
   un registro DNS del dominio apuntando al servidor.
 
@@ -40,8 +40,8 @@ docker compose logs -f setup   # espera "==> Listo" (varios minutos la primera v
 - LibreDTE Slim: http://localhost:8080 (usuario `demo`, contraseña `Slim123%`).
 - Mailpit, con el correo que envía Slim: http://localhost:8025
 
-El primer `up` **construye** la imagen de Slim (clona el repositorio e instala sus
-dependencias): tarda varios minutos. Los siguientes arrancan en segundos.
+El primer `up` descarga las imágenes y crea la base de datos: tarda unos minutos.
+Los siguientes arrancan en segundos.
 
 `.env.example` carga datos de demostración. Si prefieres partir sin ellos, pon
 `SLIM_SEED_DEMO=0` antes del primer `up`: el primer usuario y el contribuyente se
@@ -136,14 +136,18 @@ Con la consola (`console`) los archivos quedan a nombre del usuario `slim`.
 
 ## Versiones y actualización
 
-- **Slim**: `SLIM_VERSION` vacío usa el último commit de la rama por defecto del
-  repositorio; con un tag (ej. `SLIM_VERSION=v0.1.0b1`) se fija esa versión. El pie
-  de la aplicación muestra la versión y el commit con el que corre.
-  - Con un tag: cambia `SLIM_VERSION` y ejecuta `docker compose up -d --build`.
-  - Sin tag, para traer lo último: `docker compose build --pull --no-cache web` y
-    `docker compose up -d` (Docker reutiliza la capa del clon si no se pide
-    `--no-cache`).
-  - `setup` aplica las migraciones al arrancar.
+- **Slim**: `SLIM_VERSION` es el tag de la imagen publicada
+  (`ghcr.io/libredte/libredte-app-slim:<tag>`; las plantillas traen `v0.1.0b1`). El
+  pie de la aplicación muestra la versión y el commit con el que corre.
+  - Para cambiar de versión: edita `SLIM_VERSION` en `.env`, luego
+    `docker compose pull` y `docker compose up -d`. `setup` aplica las migraciones al
+    arrancar.
+  - Si la imagen de ese tag no se puede descargar, Compose lo avisa y la construye
+    desde el código de ese tag (varios minutos).
+  - Con `SLIM_VERSION` vacío, la imagen se construye siempre en tu equipo con el
+    último commit de la rama por defecto de `SLIM_REPO`
+    (`docker compose build --pull --no-cache` y `docker compose up -d` para traer lo
+    último). Es útil para probar cambios; en producción, usa un tag.
 - **Core API**: LibreDTE Lib Core API no publica versiones numeradas. `latest` es la
   última (`docker compose pull libredte-lib-core-api && docker compose up -d`).
   Para fijarla, usa como `CORE_API_VERSION` el hash completo del commit
@@ -217,9 +221,10 @@ las documentan una por una. Las principales: `SITE_HOSTNAME`, `SITE_ADDRESS`,
 
 ## Decisiones
 
-- **Imagen de Slim construida aquí**: Slim no publica imagen. Este repositorio la
-  construye clonando la app (`image/Dockerfile`, Python 3.14 sobre Debian slim: sus
-  dependencias traen binarios `manylinux`), instalando dependencias con `uv`.
+- **Imagen de Slim**: la publica el repositorio de la app en `ghcr.io` al subir un
+  tag de versión, con el `Dockerfile` de la propia app (Python 3.14 sobre Debian
+  slim, dependencias con `uv`). El stack la descarga; solo la construye si se pide
+  (`SLIM_VERSION` vacío) o no se puede descargar.
 - **Caddy** como servidor web y **PostgreSQL** como única base de datos del stack
   (con web y workers concurrentes, SQLite no sirve).
 - **Valkey** en vez de Redis (compatible, licencia abierta).
@@ -231,7 +236,8 @@ las documentan una por una. Las principales: `SITE_HOSTNAME`, `SITE_ADDRESS`,
 
 Probado en Docker Desktop (macOS, arm64, 8 GB):
 
-- Los cuatro comandos del inicio rápido, de cero, con demo: login, páginas,
+- Los cuatro comandos del inicio rápido, de cero, con demo (imagen de Slim
+  descargada de `ghcr.io`, y también construida desde el repositorio): login, páginas,
   descarga de PDF (generado por la Core API) y emisión masiva con PDF (worker, enlace
   de descarga en el correo, ZIP descargable).
 - Plantilla de producción sin demo: pantalla de alta del primer usuario, login del
